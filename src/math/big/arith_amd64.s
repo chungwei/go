@@ -30,8 +30,6 @@ TEXT ·divWW(SB),NOSPLIT,$0
 // The carry bit is saved with SBBQ Rx, Rx: if the carry was set, Rx is -1, otherwise it is 0.
 // It is restored with ADDQ Rx, Rx: if Rx was -1 the carry is set, otherwise it is cleared.
 // This is faster than using rotate instructions.
-//
-// CAUTION: Note that MOVQ $0, Rx is translated to XORQ Rx, Rx which clears the carry bit!
 
 // func addVV(z, x, y []Word) (c Word)
 TEXT ·addVV(SB),NOSPLIT,$0
@@ -326,6 +324,41 @@ TEXT ·mulAddVWW(SB),NOSPLIT,$0
 	MOVQ r+56(FP), CX	// c = r
 	MOVQ z_len+8(FP), R11
 	MOVQ $0, BX		// i = 0
+	
+	CMPQ R11, $4
+	JL E5
+	
+U5:	// i+4 <= n
+	// regular loop body unrolled 4x
+	MOVQ (0*8)(R8)(BX*8), AX
+	MULQ R9
+	ADDQ CX, AX
+	ADCQ $0, DX
+	MOVQ AX, (0*8)(R10)(BX*8)
+	MOVQ DX, CX
+	MOVQ (1*8)(R8)(BX*8), AX
+	MULQ R9
+	ADDQ CX, AX
+	ADCQ $0, DX
+	MOVQ AX, (1*8)(R10)(BX*8)
+	MOVQ DX, CX
+	MOVQ (2*8)(R8)(BX*8), AX
+	MULQ R9
+	ADDQ CX, AX
+	ADCQ $0, DX
+	MOVQ AX, (2*8)(R10)(BX*8)
+	MOVQ DX, CX
+	MOVQ (3*8)(R8)(BX*8), AX
+	MULQ R9
+	ADDQ CX, AX
+	ADCQ $0, DX
+	MOVQ AX, (3*8)(R10)(BX*8)
+	MOVQ DX, CX
+	ADDQ $4, BX		// i += 4
+	
+	LEAQ 4(BX), DX
+	CMPQ DX, R11
+	JLE U5
 	JMP E5
 
 L5:	MOVQ (R8)(BX*8), AX
@@ -414,15 +447,4 @@ E7:	SUBQ $1, BX		// i--
 	JGE L7			// i >= 0
 
 	MOVQ DX, r+64(FP)
-	RET
-
-// func bitLen(x Word) (n int)
-TEXT ·bitLen(SB),NOSPLIT,$0
-	BSRQ x+0(FP), AX
-	JZ Z1
-	ADDQ $1, AX
-	MOVQ AX, n+8(FP)
-	RET
-
-Z1:	MOVQ $0, n+8(FP)
 	RET

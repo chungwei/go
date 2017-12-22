@@ -52,7 +52,7 @@ var (
 
 	// dirs are the directories to look for *.go files in.
 	// TODO(bradfitz): just use all directories?
-	dirs = []string{".", "ken", "chan", "interface", "syntax", "dwarf", "fixedbugs", "bugs"}
+	dirs = []string{".", "ken", "chan", "interface", "syntax", "dwarf", "fixedbugs"}
 
 	// ratec controls the max number of tests running at a time.
 	ratec chan bool
@@ -193,8 +193,9 @@ func goFiles(dir string) []string {
 
 type runCmd func(...string) ([]byte, error)
 
-func compileFile(runcmd runCmd, longname string) (out []byte, err error) {
+func compileFile(runcmd runCmd, longname string, flags []string) (out []byte, err error) {
 	cmd := []string{"go", "tool", "compile", "-e"}
+	cmd = append(cmd, flags...)
 	if *linkshared {
 		cmd = append(cmd, "-dynlink", "-installsuffix=dynlink")
 	}
@@ -242,8 +243,7 @@ type test struct {
 	donec       chan bool // closed when done
 	dt          time.Duration
 
-	src    string
-	action string // "compile", "build", etc.
+	src string
 
 	tempDir string
 	err     error
@@ -417,6 +417,14 @@ func (ctxt *context) match(name string) bool {
 
 func init() { checkShouldTest() }
 
+// goGcflags returns the -gcflags argument to use with go build / go run.
+// This must match the flags used for building the standard libary,
+// or else the commands will rebuild any needed packages (like runtime)
+// over and over.
+func goGcflags() string {
+	return "-gcflags=" + os.Getenv("GO_GCFLAGS")
+}
+
 // run runs a test.
 func (t *test) run() {
 	start := time.Now()
@@ -457,15 +465,16 @@ func (t *test) run() {
 		pkgPos = pos // some files are intentionally malformed
 	}
 	if ok, why := shouldTest(t.src[:pkgPos], goos, goarch); !ok {
-		t.action = "skip"
 		if *showSkips {
-			fmt.Printf("%-20s %-20s: %s\n", t.action, t.goFileName(), why)
+			fmt.Printf("%-20s %-20s: %s\n", "skip", t.goFileName(), why)
 		}
 		return
 	}
 
 	var args, flags []string
+	var tim int
 	wantError := false
+	wantAuto := false
 	singlefilepkgs := false
 	f := strings.Fields(action)
 	if len(f) > 0 {
@@ -477,27 +486,25 @@ func (t *test) run() {
 	switch action {
 	case "rundircmpout":
 		action = "rundir"
-		t.action = "rundir"
 	case "cmpout":
 		action = "run" // the run case already looks for <dir>/<test>.out files
-		fallthrough
-	case "compile", "compiledir", "build", "run", "runoutput", "rundir":
-		t.action = action
+	case "compile", "compiledir", "build", "builddir", "run", "buildrun", "runoutput", "rundir":
+		// nothing to do
 	case "errorcheckandrundir":
 		wantError = false // should be no error if also will run
-		fallthrough
+	case "errorcheckwithauto":
+		action = "errorcheck"
+		wantAuto = true
+		wantError = true
 	case "errorcheck", "errorcheckdir", "errorcheckoutput":
-		t.action = action
 		wantError = true
 	case "skip":
 		if *runSkips {
 			break
 		}
-		t.action = "skip"
 		return
 	default:
 		t.err = skipError("skipped; unknown pattern: " + action)
-		t.action = "??"
 		return
 	}
 
@@ -508,6 +515,14 @@ func (t *test) run() {
 			wantError = false
 		case "-s":
 			singlefilepkgs = true
+		case "-t": // timeout in seconds
+			args = args[1:]
+			var err error
+			tim, err = strconv.Atoi(args[0])
+			if err != nil {
+				t.err = fmt.Errorf("need number of seconds for -t timeout, got %s instead", args[0])
+			}
+
 		default:
 			flags = append(flags, args[0])
 		}
@@ -542,7 +557,31 @@ func (t *test) run() {
 		} else {
 			cmd.Env = os.Environ()
 		}
-		err := cmd.Run()
+
+		var err error
+
+		if tim != 0 {
+			err = cmd.Start()
+			// This command-timeout code adapted from cmd/go/test.go
+			if err == nil {
+				tick := time.NewTimer(time.Duration(tim) * time.Second)
+				done := make(chan error)
+				go func() {
+					done <- cmd.Wait()
+				}()
+				select {
+				case err = <-done:
+					// ok
+				case <-tick.C:
+					cmd.Process.Kill()
+					err = <-done
+					// err = errors.New("Test timeout")
+				}
+				tick.Stop()
+			}
+		} else {
+			err = cmd.Run()
+		}
 		if err != nil {
 			err = fmt.Errorf("%s\n%s", err, buf.Bytes())
 		}
@@ -555,7 +594,8 @@ func (t *test) run() {
 		t.err = fmt.Errorf("unimplemented action %q", action)
 
 	case "errorcheck":
-		cmdline := []string{"go", "tool", "compile", "-e", "-o", "a.o"}
+		// TODO(gri) remove need for -C (disable printing of columns in error messages)
+		cmdline := []string{"go", "tool", "compile", "-C", "-e", "-o", "a.o"}
 		// No need to add -dynlink even if linkshared if we're just checking for errors...
 		cmdline = append(cmdline, flags...)
 		cmdline = append(cmdline, long)
@@ -574,11 +614,11 @@ func (t *test) run() {
 		if *updateErrors {
 			t.updateErrors(string(out), long)
 		}
-		t.err = t.errorCheck(string(out), long, t.gofile)
+		t.err = t.errorCheck(string(out), wantAuto, long, t.gofile)
 		return
 
 	case "compile":
-		_, t.err = compileFile(runcmd, long)
+		_, t.err = compileFile(runcmd, long, flags)
 
 	case "compiledir":
 		// Compile all files in the directory in lexicographic order.
@@ -622,7 +662,7 @@ func (t *test) run() {
 			for _, name := range gofiles {
 				fullshort = append(fullshort, filepath.Join(longdir, name), name)
 			}
-			t.err = t.errorCheck(string(out), fullshort...)
+			t.err = t.errorCheck(string(out), wantAuto, fullshort...)
 			if t.err != nil {
 				break
 			}
@@ -669,19 +709,131 @@ func (t *test) run() {
 		}
 
 	case "build":
-		_, err := runcmd("go", "build", "-o", "a.exe", long)
+		_, err := runcmd("go", "build", goGcflags(), "-o", "a.exe", long)
 		if err != nil {
 			t.err = err
 		}
 
-	case "run":
-		useTmp = false
-		cmd := []string{"go", "run"}
+	case "builddir":
+		// Build an executable from all the .go and .s files in a subdirectory.
+		useTmp = true
+		longdir := filepath.Join(cwd, t.goDirName())
+		files, dirErr := ioutil.ReadDir(longdir)
+		if dirErr != nil {
+			t.err = dirErr
+			break
+		}
+		var gos []os.FileInfo
+		var asms []os.FileInfo
+		for _, file := range files {
+			switch filepath.Ext(file.Name()) {
+			case ".go":
+				gos = append(gos, file)
+			case ".s":
+				asms = append(asms, file)
+			}
+
+		}
+		var objs []string
+		cmd := []string{"go", "tool", "compile", "-e", "-D", ".", "-I", ".", "-o", "go.o"}
+		if len(asms) > 0 {
+			cmd = append(cmd, "-asmhdr", "go_asm.h")
+		}
+		for _, file := range gos {
+			cmd = append(cmd, filepath.Join(longdir, file.Name()))
+		}
+		_, err := runcmd(cmd...)
+		if err != nil {
+			t.err = err
+			break
+		}
+		objs = append(objs, "go.o")
+		if len(asms) > 0 {
+			cmd = []string{"go", "tool", "asm", "-e", "-I", ".", "-o", "asm.o"}
+			for _, file := range asms {
+				cmd = append(cmd, filepath.Join(longdir, file.Name()))
+			}
+			_, err = runcmd(cmd...)
+			if err != nil {
+				t.err = err
+				break
+			}
+			objs = append(objs, "asm.o")
+		}
+		cmd = []string{"go", "tool", "pack", "c", "all.a"}
+		cmd = append(cmd, objs...)
+		_, err = runcmd(cmd...)
+		if err != nil {
+			t.err = err
+			break
+		}
+		cmd = []string{"go", "tool", "link", "all.a"}
+		_, err = runcmd(cmd...)
+		if err != nil {
+			t.err = err
+			break
+		}
+
+	case "buildrun": // build binary, then run binary, instead of go run. Useful for timeout tests where failure mode is infinite loop.
+		// TODO: not supported on NaCl
+		useTmp = true
+		cmd := []string{"go", "build", goGcflags(), "-o", "a.exe"}
 		if *linkshared {
 			cmd = append(cmd, "-linkshared")
 		}
-		cmd = append(cmd, t.goFileName())
-		out, err := runcmd(append(cmd, args...)...)
+		longdirgofile := filepath.Join(filepath.Join(cwd, t.dir), t.gofile)
+		cmd = append(cmd, flags...)
+		cmd = append(cmd, longdirgofile)
+		out, err := runcmd(cmd...)
+		if err != nil {
+			t.err = err
+			return
+		}
+		cmd = []string{"./a.exe"}
+		out, err = runcmd(append(cmd, args...)...)
+		if err != nil {
+			t.err = err
+			return
+		}
+
+		if strings.Replace(string(out), "\r\n", "\n", -1) != t.expectedOutput() {
+			t.err = fmt.Errorf("incorrect output\n%s", out)
+		}
+
+	case "run":
+		useTmp = false
+		var out []byte
+		var err error
+		if len(flags)+len(args) == 0 && goGcflags() == "" && !*linkshared {
+			// If we're not using special go command flags,
+			// skip all the go command machinery.
+			// This avoids any time the go command would
+			// spend checking whether, for example, the installed
+			// package runtime is up to date.
+			// Because we run lots of trivial test programs,
+			// the time adds up.
+			pkg := filepath.Join(t.tempDir, "pkg.a")
+			if _, err := runcmd("go", "tool", "compile", "-o", pkg, t.goFileName()); err != nil {
+				t.err = err
+				return
+			}
+			exe := filepath.Join(t.tempDir, "test.exe")
+			cmd := []string{"go", "tool", "link", "-s", "-w"}
+			cmd = append(cmd, "-o", exe, pkg)
+			if _, err := runcmd(cmd...); err != nil {
+				t.err = err
+				return
+			}
+			out, err = runcmd(append([]string{exe}, args...)...)
+		} else {
+			cmd := []string{"go", "run", goGcflags()}
+			if *linkshared {
+				cmd = append(cmd, "-linkshared")
+			}
+			cmd = append(cmd, flags...)
+			cmd = append(cmd, t.goFileName())
+			out, err = runcmd(append(cmd, args...)...)
+		}
 		if err != nil {
 			t.err = err
 			return
@@ -696,7 +848,7 @@ func (t *test) run() {
 			<-rungatec
 		}()
 		useTmp = false
-		cmd := []string{"go", "run"}
+		cmd := []string{"go", "run", goGcflags()}
 		if *linkshared {
 			cmd = append(cmd, "-linkshared")
 		}
@@ -711,7 +863,7 @@ func (t *test) run() {
 			t.err = fmt.Errorf("write tempfile:%s", err)
 			return
 		}
-		cmd = []string{"go", "run"}
+		cmd = []string{"go", "run", goGcflags()}
 		if *linkshared {
 			cmd = append(cmd, "-linkshared")
 		}
@@ -727,7 +879,7 @@ func (t *test) run() {
 
 	case "errorcheckoutput":
 		useTmp = false
-		cmd := []string{"go", "run"}
+		cmd := []string{"go", "run", goGcflags()}
 		if *linkshared {
 			cmd = append(cmd, "-linkshared")
 		}
@@ -758,7 +910,7 @@ func (t *test) run() {
 				return
 			}
 		}
-		t.err = t.errorCheck(string(out), tfile, "tmp__.go")
+		t.err = t.errorCheck(string(out), false, tfile, "tmp__.go")
 		return
 	}
 }
@@ -801,7 +953,7 @@ func (t *test) expectedOutput() string {
 	return string(b)
 }
 
-func splitOutput(out string) []string {
+func splitOutput(out string, wantAuto bool) []string {
 	// gc error messages continue onto additional lines with leading tabs.
 	// Split the output at the beginning of each line that doesn't begin with a tab.
 	// <autogenerated> lines are impossible to match so those are filtered out.
@@ -812,7 +964,7 @@ func splitOutput(out string) []string {
 		}
 		if strings.HasPrefix(line, "\t") {
 			res[len(res)-1] += "\n" + line
-		} else if strings.HasPrefix(line, "go tool") || strings.HasPrefix(line, "<autogenerated>") || strings.HasPrefix(line, "#") {
+		} else if strings.HasPrefix(line, "go tool") || strings.HasPrefix(line, "#") || !wantAuto && strings.HasPrefix(line, "<autogenerated>") {
 			continue
 		} else if strings.TrimSpace(line) != "" {
 			res = append(res, line)
@@ -821,14 +973,14 @@ func splitOutput(out string) []string {
 	return res
 }
 
-func (t *test) errorCheck(outStr string, fullshort ...string) (err error) {
+func (t *test) errorCheck(outStr string, wantAuto bool, fullshort ...string) (err error) {
 	defer func() {
 		if *verbose && err != nil {
 			log.Printf("%s gc output:\n%s", t, outStr)
 		}
 	}()
 	var errs []error
-	out := splitOutput(outStr)
+	out := splitOutput(outStr, wantAuto)
 
 	// Cut directory name.
 	for i := range out {
@@ -846,7 +998,11 @@ func (t *test) errorCheck(outStr string, fullshort ...string) (err error) {
 
 	for _, we := range want {
 		var errmsgs []string
-		errmsgs, out = partitionStrings(we.prefix, out)
+		if we.auto {
+			errmsgs, out = partitionStrings("<autogenerated>", out)
+		} else {
+			errmsgs, out = partitionStrings(we.prefix, out)
+		}
 		if len(errmsgs) == 0 {
 			errs = append(errs, fmt.Errorf("%s:%d: missing error %q", we.file, we.lineNum, we.reStr))
 			continue
@@ -854,7 +1010,13 @@ func (t *test) errorCheck(outStr string, fullshort ...string) (err error) {
 		matched := false
 		n := len(out)
 		for _, errmsg := range errmsgs {
-			if we.re.MatchString(errmsg) {
+			// Assume errmsg says "file:line: foo".
+			// Cut leading "file:line: " to avoid accidental matching of file name instead of message.
+			text := errmsg
+			if i := strings.Index(text, " "); i >= 0 {
+				text = text[i+1:]
+			}
+			if we.re.MatchString(text) {
 				matched = true
 			} else {
 				out = append(out, errmsg)
@@ -906,7 +1068,7 @@ func (t *test) updateErrors(out, file string) {
 	// Parse new errors.
 	errors := make(map[int]map[string]bool)
 	tmpRe := regexp.MustCompile(`autotmp_[0-9]+`)
-	for _, errStr := range splitOutput(out) {
+	for _, errStr := range splitOutput(out, false) {
 		colon1 := strings.Index(errStr, ":")
 		if colon1 < 0 || errStr[:colon1] != file {
 			continue
@@ -991,12 +1153,14 @@ type wantedError struct {
 	reStr   string
 	re      *regexp.Regexp
 	lineNum int
+	auto    bool // match <autogenerated> line
 	file    string
 	prefix  string
 }
 
 var (
 	errRx       = regexp.MustCompile(`// (?:GC_)?ERROR (.*)`)
+	errAutoRx   = regexp.MustCompile(`// (?:GC_)?ERRORAUTO (.*)`)
 	errQuotesRx = regexp.MustCompile(`"([^"]*)"`)
 	lineRx      = regexp.MustCompile(`LINE(([+-])([0-9]+))?`)
 )
@@ -1011,7 +1175,13 @@ func (t *test) wantedErrors(file, short string) (errs []wantedError) {
 			// double comment disables ERROR
 			continue
 		}
-		m := errRx.FindStringSubmatch(line)
+		var auto bool
+		m := errAutoRx.FindStringSubmatch(line)
+		if m != nil {
+			auto = true
+		} else {
+			m = errRx.FindStringSubmatch(line)
+		}
 		if m == nil {
 			continue
 		}
@@ -1046,6 +1216,7 @@ func (t *test) wantedErrors(file, short string) (errs []wantedError) {
 				reStr:   rx,
 				re:      re,
 				prefix:  prefix,
+				auto:    auto,
 				lineNum: lineNum,
 				file:    short,
 			})

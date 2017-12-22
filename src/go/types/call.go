@@ -93,7 +93,9 @@ func (check *Checker) call(x *operand, e *ast.CallExpr) exprKind {
 func (check *Checker) use(arg ...ast.Expr) {
 	var x operand
 	for _, e := range arg {
-		check.rawExpr(&x, e, nil)
+		if e != nil { // be safe
+			check.rawExpr(&x, e, nil)
+		}
 	}
 }
 
@@ -132,47 +134,46 @@ type getter func(x *operand, i int)
 // the incoming getter with that i.
 //
 func unpack(get getter, n int, allowCommaOk bool) (getter, int, bool) {
-	if n == 1 {
-		// possibly result of an n-valued function call or comma,ok value
-		var x0 operand
-		get(&x0, 0)
-		if x0.mode == invalid {
-			return nil, 0, false
-		}
+	if n != 1 {
+		// zero or multiple values
+		return get, n, false
+	}
+	// possibly result of an n-valued function call or comma,ok value
+	var x0 operand
+	get(&x0, 0)
+	if x0.mode == invalid {
+		return nil, 0, false
+	}
 
-		if t, ok := x0.typ.(*Tuple); ok {
-			// result of an n-valued function call
+	if t, ok := x0.typ.(*Tuple); ok {
+		// result of an n-valued function call
+		return func(x *operand, i int) {
+			x.mode = value
+			x.expr = x0.expr
+			x.typ = t.At(i).typ
+		}, t.Len(), false
+	}
+
+	if x0.mode == mapindex || x0.mode == commaok {
+		// comma-ok value
+		if allowCommaOk {
+			a := [2]Type{x0.typ, Typ[UntypedBool]}
 			return func(x *operand, i int) {
 				x.mode = value
 				x.expr = x0.expr
-				x.typ = t.At(i).typ
-			}, t.Len(), false
+				x.typ = a[i]
+			}, 2, true
 		}
-
-		if x0.mode == mapindex || x0.mode == commaok {
-			// comma-ok value
-			if allowCommaOk {
-				a := [2]Type{x0.typ, Typ[UntypedBool]}
-				return func(x *operand, i int) {
-					x.mode = value
-					x.expr = x0.expr
-					x.typ = a[i]
-				}, 2, true
-			}
-			x0.mode = value
-		}
-
-		// single value
-		return func(x *operand, i int) {
-			if i != 0 {
-				unreachable()
-			}
-			*x = x0
-		}, 1, false
+		x0.mode = value
 	}
 
-	// zero or multiple values
-	return get, n, false
+	// single value
+	return func(x *operand, i int) {
+		if i != 0 {
+			unreachable()
+		}
+		*x = x0
+	}, 1, false
 }
 
 // arguments checks argument passing for the call with the given signature.
@@ -250,7 +251,7 @@ func (check *Checker) argument(fun ast.Expr, sig *Signature, i int, x *operand, 
 			check.errorf(ellipsis, "can only use ... with matching parameter")
 			return
 		}
-		if _, ok := x.typ.Underlying().(*Slice); !ok {
+		if _, ok := x.typ.Underlying().(*Slice); !ok && x.typ != Typ[UntypedNil] { // see issue #18268
 			check.errorf(x.pos(), "cannot use %s as parameter of type %s", x, typ)
 			return
 		}
@@ -277,22 +278,24 @@ func (check *Checker) selector(x *operand, e *ast.SelectorExpr) {
 	// selector expressions.
 	if ident, ok := e.X.(*ast.Ident); ok {
 		_, obj := check.scope.LookupParent(ident.Name, check.pos)
-		if pkg, _ := obj.(*PkgName); pkg != nil {
-			assert(pkg.pkg == check.pkg)
-			check.recordUse(ident, pkg)
-			pkg.used = true
-			exp := pkg.imported.scope.Lookup(sel)
+		if pname, _ := obj.(*PkgName); pname != nil {
+			assert(pname.pkg == check.pkg)
+			check.recordUse(ident, pname)
+			pname.used = true
+			pkg := pname.imported
+			exp := pkg.scope.Lookup(sel)
 			if exp == nil {
-				if !pkg.imported.fake {
-					check.errorf(e.Pos(), "%s not declared by package %s", sel, ident)
+				if !pkg.fake {
+					check.errorf(e.Pos(), "%s not declared by package %s", sel, pkg.name)
 				}
 				goto Error
 			}
 			if !exp.Exported() {
-				check.errorf(e.Pos(), "%s not exported by package %s", sel, ident)
+				check.errorf(e.Pos(), "%s not exported by package %s", sel, pkg.name)
 				// ok to continue
 			}
 			check.recordUse(e.Sel, exp)
+
 			// Simplified version of the code for *ast.Idents:
 			// - imported objects are always fully initialized
 			switch exp := exp.(type) {
@@ -315,6 +318,7 @@ func (check *Checker) selector(x *operand, e *ast.SelectorExpr) {
 				x.typ = exp.typ
 				x.id = exp.id
 			default:
+				check.dump("unexpected object %v", exp)
 				unreachable()
 			}
 			x.expr = e

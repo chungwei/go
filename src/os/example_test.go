@@ -21,6 +21,20 @@ func ExampleOpenFile() {
 	}
 }
 
+func ExampleOpenFile_append() {
+	// If the file doesn't exist, create it, or append to the file
+	f, err := os.OpenFile("access.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if _, err := f.Write([]byte("appended some data\n")); err != nil {
+		log.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		log.Fatal(err)
+	}
+}
+
 func ExampleChmod() {
 	if err := os.Chmod("some-filename", 0644); err != nil {
 		log.Fatal(err)
@@ -36,7 +50,7 @@ func ExampleChtimes() {
 }
 
 func ExampleFileMode() {
-	fi, err := os.Stat("some-filename")
+	fi, err := os.Lstat("some-filename")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -51,4 +65,56 @@ func ExampleFileMode() {
 	case mode&os.ModeNamedPipe != 0:
 		fmt.Println("named pipe")
 	}
+}
+
+func ExampleIsNotExist() {
+	filename := "a-nonexistent-file"
+	if _, err := os.Stat(filename); os.IsNotExist(err) {
+		fmt.Printf("file does not exist")
+	}
+	// Output:
+	// file does not exist
+}
+
+func init() {
+	os.Setenv("USER", "gopher")
+	os.Setenv("HOME", "/usr/gopher")
+	os.Unsetenv("GOPATH")
+}
+
+func ExampleExpandEnv() {
+	fmt.Println(os.ExpandEnv("$USER lives in ${HOME}."))
+
+	// Output:
+	// gopher lives in /usr/gopher.
+}
+
+func ExampleLookupEnv() {
+	show := func(key string) {
+		val, ok := os.LookupEnv(key)
+		if !ok {
+			fmt.Printf("%s not set\n", key)
+		} else {
+			fmt.Printf("%s=%s\n", key, val)
+		}
+	}
+
+	show("USER")
+	show("GOPATH")
+
+	// Output:
+	// USER=gopher
+	// GOPATH not set
+}
+
+func ExampleGetenv() {
+	fmt.Printf("%s lives in %s.\n", os.Getenv("USER"), os.Getenv("HOME"))
+
+	// Output:
+	// gopher lives in /usr/gopher.
+}
+
+func ExampleUnsetenv() {
+	os.Setenv("TMPDIR", "/my/tmp")
+	defer os.Unsetenv("TMPDIR")
 }

@@ -6,13 +6,16 @@ package exec_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 func ExampleLookPath() {
@@ -35,12 +38,30 @@ func ExampleCommand() {
 	fmt.Printf("in all caps: %q\n", out.String())
 }
 
+func ExampleCommand_environment() {
+	cmd := exec.Command("prog")
+	cmd.Env = append(os.Environ(),
+		"FOO=duplicate_value", // ignored
+		"FOO=actual_value",    // this value is used
+	)
+	if err := cmd.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
 func ExampleCmd_Output() {
 	out, err := exec.Command("date").Output()
 	if err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("The date is %s\n", out)
+}
+
+func ExampleCmd_Run() {
+	cmd := exec.Command("sleep", "1")
+	log.Printf("Running command and waiting for it to finish...")
+	err := cmd.Run()
+	log.Printf("Command finished with error: %v", err)
 }
 
 func ExampleCmd_Start() {
@@ -122,4 +143,14 @@ func ExampleCmd_CombinedOutput() {
 		log.Fatal(err)
 	}
 	fmt.Printf("%s\n", stdoutStderr)
+}
+
+func ExampleCommandContext() {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	if err := exec.CommandContext(ctx, "sleep", "5").Run(); err != nil {
+		// This will fail after 100 milliseconds. The 5 second sleep
+		// will be interrupted.
+	}
 }

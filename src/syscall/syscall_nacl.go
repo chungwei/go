@@ -10,7 +10,6 @@ import (
 )
 
 //sys	naclClose(fd int) (err error) = sys_close
-//sys	Exit(code int) (err error)
 //sys	naclFstat(fd int, stat *Stat_t) (err error) = sys_fstat
 //sys	naclRead(fd int, b []byte) (n int, err error) = sys_read
 //sys	naclSeek(fd int, off *int64, whence int) (err error) = sys_lseek
@@ -296,3 +295,5 @@ func RouteRIB(facility, param int) ([]byte, error)                { return nil, 
 func ParseRoutingMessage(b []byte) ([]RoutingMessage, error)      { return nil, ENOSYS }
 func ParseRoutingSockaddr(msg RoutingMessage) ([]Sockaddr, error) { return nil, ENOSYS }
 func SysctlUint32(name string) (value uint32, err error)          { return 0, ENOSYS }
+
+type Iovec struct{} // dummy

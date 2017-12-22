@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -16,9 +18,11 @@ import (
 var someTime = time.Unix(123, 0)
 var answer int64 = 42
 
-type userDefined float64
-
-type userDefinedSlice []int
+type (
+	userDefined       float64
+	userDefinedSlice  []int
+	userDefinedString string
+)
 
 type conversionTest struct {
 	s, d interface{} // source and destination
@@ -38,6 +42,7 @@ type conversionTest struct {
 	wantptr    *int64 // if non-nil, *d's pointed value must be equal to *wantptr
 	wantnil    bool   // if true, *d must be *int64(nil)
 	wantusrdef userDefined
+	wantusrstr userDefinedString
 }
 
 // Target variables for scanning into.
@@ -101,6 +106,7 @@ var conversionTests = []conversionTest{
 	// To RawBytes
 	{s: nil, d: &scanraw, wantraw: nil},
 	{s: []byte("byteslice"), d: &scanraw, wantraw: RawBytes("byteslice")},
+	{s: "string", d: &scanraw, wantraw: RawBytes("string")},
 	{s: 123, d: &scanraw, wantraw: RawBytes("123")},
 	{s: int8(123), d: &scanraw, wantraw: RawBytes("123")},
 	{s: int64(123), d: &scanraw, wantraw: RawBytes("123")},
@@ -109,6 +115,9 @@ var conversionTests = []conversionTest{
 	{s: uint32(123), d: &scanraw, wantraw: RawBytes("123")},
 	{s: uint64(123), d: &scanraw, wantraw: RawBytes("123")},
 	{s: 1.5, d: &scanraw, wantraw: RawBytes("1.5")},
+	// time.Time has been placed here to check that the RawBytes slice gets
+	// correctly reset when calling time.Time.AppendFormat.
+	{s: time.Unix(2, 5).UTC(), d: &scanraw, wantraw: RawBytes("1970-01-01T00:00:02.000000005Z")},
 
 	// Strings to integers
 	{s: "255", d: &scanuint8, wantuint: 255},
@@ -170,6 +179,7 @@ var conversionTests = []conversionTest{
 	{s: int64(123), d: new(userDefined), wantusrdef: 123},
 	{s: "1.5", d: new(userDefined), wantusrdef: 1.5},
 	{s: []byte{1, 2, 3}, d: new(userDefinedSlice), wanterr: `unsupported Scan, storing driver.Value type []uint8 into type *sql.userDefinedSlice`},
+	{s: "str", d: new(userDefinedString), wantusrstr: "str"},
 
 	// Other errors
 	{s: complex(1, 2), d: &scanstr, wanterr: `unsupported Scan, storing driver.Value type complex128 into type *string`},
@@ -216,6 +226,12 @@ func TestConversions(t *testing.T) {
 		if ct.wantstr != "" && ct.wantstr != scanstr {
 			errf("want string %q, got %q", ct.wantstr, scanstr)
 		}
+		if ct.wantbytes != nil && string(ct.wantbytes) != string(scanbytes) {
+			errf("want byte %q, got %q", ct.wantbytes, scanbytes)
+		}
+		if ct.wantraw != nil && string(ct.wantraw) != string(scanraw) {
+			errf("want RawBytes %q, got %q", ct.wantraw, scanraw)
+		}
 		if ct.wantint != 0 && ct.wantint != intValue(ct.d) {
 			errf("want int %d, got %d", ct.wantint, intValue(ct.d))
 		}
@@ -258,6 +274,9 @@ func TestConversions(t *testing.T) {
 		}
 		if ct.wantusrdef != 0 && ct.wantusrdef != *ct.d.(*userDefined) {
 			errf("want userDefined %f, got %f", ct.wantusrdef, *ct.d.(*userDefined))
+		}
+		if len(ct.wantusrstr) != 0 && ct.wantusrstr != *ct.d.(*userDefinedString) {
+			errf("want userDefined %q, got %q", ct.wantusrstr, *ct.d.(*userDefinedString))
 		}
 	}
 }
@@ -332,6 +351,7 @@ func TestRawBytesAllocs(t *testing.T) {
 		{"float32", float32(1.5), "1.5"},
 		{"float64", float64(64), "64"},
 		{"bool", false, "false"},
+		{"time", time.Unix(2, 5).UTC(), "1970-01-01T00:00:02.000000005Z"},
 	}
 
 	buf := make(RawBytes, 10)
@@ -378,7 +398,7 @@ func TestRawBytesAllocs(t *testing.T) {
 	}
 }
 
-// https://github.com/golang/go/issues/13905
+// https://golang.org/issues/13905
 func TestUserDefinedBytes(t *testing.T) {
 	type userDefinedBytes []byte
 	var u userDefinedBytes
@@ -387,5 +407,87 @@ func TestUserDefinedBytes(t *testing.T) {
 	convertAssign(&u, v)
 	if &u[0] == &v[0] {
 		t.Fatal("userDefinedBytes got potentially dirty driver memory")
+	}
+}
+
+type Valuer_V string
+
+func (v Valuer_V) Value() (driver.Value, error) {
+	return strings.ToUpper(string(v)), nil
+}
+
+type Valuer_P string
+
+func (p *Valuer_P) Value() (driver.Value, error) {
+	if p == nil {
+		return "nil-to-str", nil
+	}
+	return strings.ToUpper(string(*p)), nil
+}
+
+func TestDriverArgs(t *testing.T) {
+	var nilValuerVPtr *Valuer_V
+	var nilValuerPPtr *Valuer_P
+	var nilStrPtr *string
+	tests := []struct {
+		args []interface{}
+		want []driver.NamedValue
+	}{
+		0: {
+			args: []interface{}{Valuer_V("foo")},
+			want: []driver.NamedValue{
+				driver.NamedValue{
+					Ordinal: 1,
+					Value:   "FOO",
+				},
+			},
+		},
+		1: {
+			args: []interface{}{nilValuerVPtr},
+			want: []driver.NamedValue{
+				driver.NamedValue{
+					Ordinal: 1,
+					Value:   nil,
+				},
+			},
+		},
+		2: {
+			args: []interface{}{nilValuerPPtr},
+			want: []driver.NamedValue{
+				driver.NamedValue{
+					Ordinal: 1,
+					Value:   "nil-to-str",
+				},
+			},
+		},
+		3: {
+			args: []interface{}{"plain-str"},
+			want: []driver.NamedValue{
+				driver.NamedValue{
+					Ordinal: 1,
+					Value:   "plain-str",
+				},
+			},
+		},
+		4: {
+			args: []interface{}{nilStrPtr},
+			want: []driver.NamedValue{
+				driver.NamedValue{
+					Ordinal: 1,
+					Value:   nil,
+				},
+			},
+		},
+	}
+	for i, tt := range tests {
+		ds := &driverStmt{Locker: &sync.Mutex{}, si: stubDriverStmt{nil}}
+		got, err := driverArgsConnLocked(nil, ds, tt.args)
+		if err != nil {
+			t.Errorf("test[%d]: %v", i, err)
+			continue
+		}
+		if !reflect.DeepEqual(got, tt.want) {
+			t.Errorf("test[%d]: got %v, want %v", i, got, tt.want)
+		}
 	}
 }

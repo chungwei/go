@@ -116,6 +116,18 @@ func TestFormatShortYear(t *testing.T) {
 	}
 }
 
+// issue 22802.
+func TestFormatSpacePadding(t *testing.T) {
+	for i := 9; i <= 10; i++ {
+		time := Date(2001, Month(i), i, i, i, i, 700000000, UTC)
+		result := time.Format("2006-_1-_2 _3:_4:_5")
+		want := fmt.Sprintf("2001-%2d-%2d %2d:%2d:%2d", i, i, i, i, i)
+		if result != want {
+			t.Errorf("SpacePadding expected %q got %q", want, result)
+		}
+	}
+}
+
 type ParseTest struct {
 	name       string
 	format     string
@@ -224,6 +236,7 @@ var dayOutOfRangeTests = []struct {
 	{"Thu Nov 31 21:00:57 2010", false},
 	{"Thu Dec 31 21:00:57 2010", true},
 	{"Thu Dec 32 21:00:57 2010", false},
+	{"Thu Dec 00 21:00:57 2010", false},
 }
 
 func TestParseDayOutOfRange(t *testing.T) {
@@ -244,27 +257,45 @@ func TestParseDayOutOfRange(t *testing.T) {
 	}
 }
 
+// TestParseInLocation checks that the Parse and ParseInLocation
+// functions do not get confused by the fact that AST (Arabia Standard
+// Time) and AST (Atlantic Standard Time) are different time zones,
+// even though they have the same abbreviation.
+//
+// ICANN has been slowly phasing out invented abbreviation in favor of
+// numeric time zones (for example, the Asia/Baghdad time zone
+// abbreviation got changed from AST to +03 in the 2017a tzdata
+// release); but we still want to make sure that the time package does
+// not get confused on systems with slightly older tzdata packages.
 func TestParseInLocation(t *testing.T) {
-	// Check that Parse (and ParseInLocation) understand that
-	// Feb 01 AST (Arabia Standard Time) and Feb 01 AST (Atlantic Standard Time)
-	// are in different time zones even though both are called AST
 
 	baghdad, err := LoadLocation("Asia/Baghdad")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t1, err := ParseInLocation("Jan 02 2006 MST", "Feb 01 2013 AST", baghdad)
+	var t1, t2 Time
+
+	t1, err = ParseInLocation("Jan 02 2006 MST", "Feb 01 2013 AST", baghdad)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t2 := Date(2013, February, 1, 00, 00, 00, 0, baghdad)
-	if t1 != t2 {
-		t.Fatalf("ParseInLocation(Feb 01 2013 AST, Baghdad) = %v, want %v", t1, t2)
-	}
+
 	_, offset := t1.Zone()
-	if offset != 3*60*60 {
-		t.Fatalf("ParseInLocation(Feb 01 2013 AST, Baghdad).Zone = _, %d, want _, %d", offset, 3*60*60)
+
+	// A zero offset means that ParseInLocation did not recognize the
+	// 'AST' abbreviation as matching the current location (Baghdad,
+	// where we'd expect a +03 hrs offset); likely because we're using
+	// a recent tzdata release (2017a or newer).
+	// If it happens, skip the Baghdad test.
+	if offset != 0 {
+		t2 = Date(2013, February, 1, 00, 00, 00, 0, baghdad)
+		if t1 != t2 {
+			t.Fatalf("ParseInLocation(Feb 01 2013 AST, Baghdad) = %v, want %v", t1, t2)
+		}
+		if offset != 3*60*60 {
+			t.Fatalf("ParseInLocation(Feb 01 2013 AST, Baghdad).Zone = _, %d, want _, %d", offset, 3*60*60)
+		}
 	}
 
 	blancSablon, err := LoadLocation("America/Blanc-Sablon")
@@ -272,6 +303,9 @@ func TestParseInLocation(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// In this case 'AST' means 'Atlantic Standard Time', and we
+	// expect the abbreviation to correctly match the american
+	// location.
 	t1, err = ParseInLocation("Jan 02 2006 MST", "Feb 01 2013 AST", blancSablon)
 	if err != nil {
 		t.Fatal(err)
@@ -356,8 +390,8 @@ func checkTime(time Time, test *ParseTest, t *testing.T) {
 func TestFormatAndParse(t *testing.T) {
 	const fmt = "Mon MST " + RFC3339 // all fields
 	f := func(sec int64) bool {
-		t1 := Unix(sec, 0)
-		if t1.Year() < 1000 || t1.Year() > 9999 {
+		t1 := Unix(sec/2, 0)
+		if t1.Year() < 1000 || t1.Year() > 9999 || t1.Unix() != sec {
 			// not required to work
 			return true
 		}
@@ -404,6 +438,7 @@ var parseTimeZoneTests = []ParseTimeZoneTest{
 	{"ESAST hi", 5, true},
 	{"ESASTT hi", 0, false}, // run of upper-case letters too long.
 	{"ESATY hi", 0, false},  // five letters must end in T.
+	{"WITA hi", 4, true},    // Issue #18251
 }
 
 func TestParseTimeZone(t *testing.T) {
@@ -442,6 +477,9 @@ var parseErrorTests = []ParseErrorTest{
 	{RFC3339, "2006-01-02T15:04:05Z_abc", `parsing time "2006-01-02T15:04:05Z_abc": extra text: _abc`},
 	// invalid second followed by optional fractional seconds
 	{RFC3339, "2010-02-04T21:00:67.012345678-08:00", "second out of range"},
+	// issue 21113
+	{"_2 Jan 06 15:04 MST", "4 --- 00 00:00 GMT", "cannot parse"},
+	{"_2 January 06 15:04 MST", "4 --- 00 00:00 GMT", "cannot parse"},
 }
 
 func TestParseErrors(t *testing.T) {
@@ -599,5 +637,27 @@ func TestUnderscoreTwoThousand(t *testing.T) {
 	}
 	if m := time.Minute(); m != 38 {
 		t.Errorf("Incorrect minute, got %d", m)
+	}
+}
+
+// issue 22802.
+func TestParseSpacePadding(t *testing.T) {
+	format := "2006-_1-_2 _3:_4:_5"
+	input := "2017- 9- 6  8: 4: 2"
+	time, err := Parse(format, input)
+	if err != nil {
+		t.Error(err)
+	}
+	if y, m, d := time.Date(); y != 2017 || m != 9 || d != 6 {
+		t.Errorf("Incorrect y/m/d, got %d/%d/%d", y, m, d)
+	}
+	if h := time.Hour(); h != 8 {
+		t.Errorf("Incorrect hour, got %d", h)
+	}
+	if m := time.Minute(); m != 4 {
+		t.Errorf("Incorrect minute, got %d", m)
+	}
+	if s := time.Second(); s != 2 {
+		t.Errorf("Incorrect second, got %d", s)
 	}
 }

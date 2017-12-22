@@ -33,7 +33,7 @@ func nacl_thread_create(fn uintptr, stk, tls, xx unsafe.Pointer) int32
 //go:noescape
 func nacl_nanosleep(ts, extra *timespec) int32
 func nanotime() int64
-func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) unsafe.Pointer
+func mmap(addr unsafe.Pointer, n uintptr, prot, flags, fd int32, off uint32) (p unsafe.Pointer, err int)
 func exit(code int32)
 func osyield()
 
@@ -45,7 +45,7 @@ func os_sigpipe() {
 	throw("too many writes on closed pipe")
 }
 
-func dieFromSignal(sig int32) {
+func dieFromSignal(sig uint32) {
 	exit(2)
 }
 
@@ -60,7 +60,7 @@ func sigpanic() {
 	panicmem()
 }
 
-func raiseproc(sig int32) {
+func raiseproc(sig uint32) {
 }
 
 // Stubs so tests can link correctly. These should never be called.
@@ -85,6 +85,11 @@ func msigsave(mp *m) {
 
 //go:nosplit
 func msigrestore(sigmask sigset) {
+}
+
+//go:nosplit
+//go:nowritebarrierrec
+func clearSignalHandlers() {
 }
 
 //go:nosplit
@@ -162,6 +167,9 @@ func newosproc(mp *m, stk unsafe.Pointer) {
 		throw("newosproc")
 	}
 }
+
+//go:noescape
+func exitThread(wait *uint32)
 
 //go:nosplit
 func semacreate(mp *m) {
@@ -254,7 +262,7 @@ func badsignalgo(sig uintptr) {
 	if !sigsend(uint32(sig)) {
 		// A foreign thread received the signal sig, and the
 		// Go code does not want to handle it.
-		raisebadsignal(int32(sig))
+		raisebadsignal(uint32(sig))
 	}
 }
 
@@ -267,17 +275,21 @@ func badsignal2() {
 
 var badsignal1 = []byte("runtime: signal received on thread not created by Go.\n")
 
-func raisebadsignal(sig int32) {
+func raisebadsignal(sig uint32) {
 	badsignal2()
 }
 
 func madvise(addr unsafe.Pointer, n uintptr, flags int32) {}
 func munmap(addr unsafe.Pointer, n uintptr)               {}
-func resetcpuprofiler(hz int32)                           {}
+func setProcessCPUProfiler(hz int32)                      {}
+func setThreadCPUProfiler(hz int32)                       {}
 func sigdisable(uint32)                                   {}
 func sigenable(uint32)                                    {}
 func sigignore(uint32)                                    {}
 func closeonexec(int32)                                   {}
+
+// gsignalStack is unused on nacl.
+type gsignalStack struct{}
 
 var writelock uint32 // test-and-set spin lock for write
 

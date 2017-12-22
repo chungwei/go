@@ -503,105 +503,72 @@ func TestInterfaceAddrsWithNetsh(t *testing.T) {
 	}
 }
 
-func getmacSpeaksEnglish(t *testing.T) bool {
-	out, err := runCmd("getmac", "/?")
-	if err != nil {
-		t.Fatal(err)
+func contains(needle string, haystack []string) bool {
+	for _, v := range haystack {
+		if v == needle {
+			return true
+		}
 	}
-	return bytes.Contains(out, []byte("network adapters on a system"))
+	return false
 }
 
-func TestInterfaceHardwareAddrWithGetmac(t *testing.T) {
-	if isWindowsXP(t) {
-		t.Skip("Windows XP does not have powershell command")
-	}
-	if !getmacSpeaksEnglish(t) {
-		t.Skip("English version of getmac required for this test")
-	}
-
+func TestInterfaceHardwareAddrWithWmic(t *testing.T) {
 	ift, err := Interfaces()
 	if err != nil {
 		t.Fatal(err)
 	}
-	have := make(map[string]string)
+	goMacToName := make(map[string]string)
 	for _, ifi := range ift {
 		if ifi.Flags&FlagLoopback != 0 {
 			// no MAC address for loopback interfaces
 			continue
 		}
-		have[ifi.Name] = ifi.HardwareAddr.String()
+		goMacToName[ifi.HardwareAddr.String()] = ifi.Name
 	}
 
-	out, err := runCmd("getmac", "/fo", "list", "/v")
+	//wmic nic get MACAddress,NetConnectionID /format:csv
+	//
+	//Node,MACAddress,NetConnectionID
+	//SERVER-2008R2-V,,
+	//SERVER-2008R2-V,42:01:0A:F0:00:18,Local Area Connection
+	//SERVER-2008R2-V,42:01:0A:F0:00:18,Duplicate Adapter
+	//SERVER-2008R2-V,20:41:53:59:4E:FF,
+	out, err := exec.Command("wmic", "nic", "get", "MACAddress,NetConnectionID", "/format:csv").CombinedOutput()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// getmac output looks like:
-	//
-	//Connection Name:  Local Area Connection
-	//Network Adapter:  Intel Gigabit Network Connection
-	//Physical Address: XX-XX-XX-XX-XX-XX
-	//Transport Name:   \Device\Tcpip_{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
-	//
-	//Connection Name:  Wireless Network Connection
-	//Network Adapter:  Wireles WLAN Card
-	//Physical Address: XX-XX-XX-XX-XX-XX
-	//Transport Name:   Media disconnected
-	//
-	//Connection Name:  Bluetooth Network Connection
-	//Network Adapter:  Bluetooth Device (Personal Area Network)
-	//Physical Address: N/A
-	//Transport Name:   Hardware not present
-	//
-	//Connection Name:  VMware Network Adapter VMnet8
-	//Network Adapter:  VMware Virtual Ethernet Adapter for VMnet8
-	//Physical Address: Disabled
-	//Transport Name:   Disconnected
-	//
-	want := make(map[string]string)
-	var name string
+	winMacToNames := make(map[string][]string)
 	lines := bytes.Split(out, []byte{'\r', '\n'})
+
 	for _, line := range lines {
-		if bytes.Contains(line, []byte("Connection Name:")) {
-			f := bytes.Split(line, []byte{':'})
-			if len(f) != 2 {
-				t.Fatalf("unexpected \"Connection Name\" line: %q", line)
-			}
-			name = string(bytes.TrimSpace(f[1]))
-			if name == "" {
-				t.Fatalf("empty name on \"Connection Name\" line: %q", line)
-			}
+		entry := strings.Split(string(line), ",")
+		if len(entry) != 3 || entry[1] == "MACAddress" {
+			// skip empty lines, header
+			continue
 		}
-		if bytes.Contains(line, []byte("Physical Address:")) {
-			if name == "" {
-				t.Fatalf("no matching name found: %q", string(out))
-			}
-			f := bytes.Split(line, []byte{':'})
-			if len(f) != 2 {
-				t.Fatalf("unexpected \"Physical Address\" line: %q", line)
-			}
-			addr := string(bytes.ToLower(bytes.TrimSpace(f[1])))
-			if addr == "" {
-				t.Fatalf("empty address on \"Physical Address\" line: %q", line)
-			}
-			if addr == "disabled" || addr == "n/a" {
-				continue
-			}
-			addr = strings.Replace(addr, "-", ":", -1)
-			want[name] = addr
-			name = ""
+
+		mac, name := strings.ToLower(entry[1]), strings.TrimSpace(entry[2])
+		if mac == "" || name == "" {
+			// skip non-physical devices
+			continue
 		}
+
+		winMacToNames[mac] = append(winMacToNames[mac], name)
 	}
 
-	for name, wantAddr := range want {
-		haveAddr, ok := have[name]
-		if !ok {
-			t.Errorf("getmac lists %q, but it could not be found among Go interfaces %v", name, have)
-			continue
+	if len(goMacToName) != len(winMacToNames) {
+		t.Errorf("go interface count (%d, %v) differs from wmic count (%d, %v)", len(goMacToName), goMacToName, len(winMacToNames), winMacToNames)
+	}
+
+	for mac, name := range goMacToName {
+		// Windows appears to associate multiple names to a single MAC
+		// Consider it a success if one of those names was found
+		if cmdNames, ok := winMacToNames[mac]; ok {
+			if contains(name, cmdNames) {
+				continue
+			}
 		}
-		if haveAddr != wantAddr {
-			t.Errorf("unexpected MAC address for %q - %v, want %v", name, haveAddr, wantAddr)
-			continue
-		}
+
+		t.Errorf("go found interface (name: %s, mac: %s) not found by wmic (%v)", name, mac, winMacToNames)
 	}
 }
